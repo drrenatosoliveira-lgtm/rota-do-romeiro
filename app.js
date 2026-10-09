@@ -139,6 +139,45 @@
   var linhaFeita = L.polyline([], { color: '#8a93ab', weight: 6, opacity: 0.9, interactive: false }).addTo(mapa);
   var linhaFalta = L.polyline(rota, { color: '#1f4fbf', weight: 6, opacity: 0.95, interactive: false }).addTo(mapa);
   var linhaVolta = L.polyline([], { color: '#c62828', weight: 3, dashArray: '6 6', interactive: false }).addTo(mapa);
+  var linhaDesvio = L.polyline([], { color: '#ef6c00', weight: 6, opacity: 0.95, interactive: false }).addTo(mapa);
+
+  // Fora da rota: calcula pelas ruas o caminho a pé de volta à Rota da Luz (sempre para frente, rumo à Basílica)
+  var desvioEmCurso = false, desvioFalhou = 0;
+  function pedirDesvio(p) {
+    if (desvioEmCurso || Date.now() - desvioFalhou < 30000) return;
+    var d0 = est.desvio;
+    if (d0 && L.latLng(d0.origem).distanceTo(p) < 150 && Date.now() - d0.t < 180000) return;
+    if (navigator.onLine === false) { est.desvioMsg = 'Sem internet para calcular pelas ruas.'; return; }
+    desvioEmCurso = true;
+    var minimo = Math.max(0, (est.maxAlong || 0) - 300), cands = [], ult = -1e9;
+    for (var i = 0; i < rota.length; i++) if (cum[i] >= minimo && cum[i] - ult >= 250) { cands.push(i); ult = cum[i]; }
+    cands.push(rota.length - 1);
+    cands.sort(function (a, b) { return L.latLng(rota[a]).distanceTo(p) - L.latLng(rota[b]).distanceTo(p); });
+    cands = cands.slice(0, 30);
+    var srv = 'https://routing.openstreetmap.de/routed-foot/';
+    var coords = [p].concat(cands.map(function (i) { return rota[i]; })).map(function (q) { return q[1].toFixed(6) + ',' + q[0].toFixed(6); }).join(';');
+    fetch(srv + 'table/v1/foot/' + coords + '?sources=0&annotations=distance').then(function (r) { return r.json(); }).then(function (t) {
+      var ds = t.distances[0].slice(1), melhor = -1, mv = 1e15;
+      ds.forEach(function (d, k) { if (d != null && d + TOTAL - cum[cands[k]] < mv) { mv = d + TOTAL - cum[cands[k]]; melhor = cands[k]; } });
+      if (melhor < 0) throw new Error('sem caminho');
+      var j = rota[melhor];
+      return fetch(srv + 'route/v1/foot/' + p[1] + ',' + p[0] + ';' + j[1] + ',' + j[0] + '?overview=full&geometries=geojson&steps=true').then(function (r) { return r.json(); }).then(function (r) {
+        var rt = r.routes[0], ruas = [];
+        rt.legs[0].steps.forEach(function (st) { if (st.name && ruas[ruas.length - 1] !== st.name) ruas.push(st.name); });
+        var cs = rt.geometry.coordinates.map(function (c) { return [c[1], c[0]]; }), kmVolta = cum[melhor];
+        // corta o caminho no primeiro ponto em que ele já encosta na rota (não precisa andar em cima da linha azul)
+        for (var q = 0; q < cs.length; q++) {
+          var pj = projetar(cs[q]);
+          if (pj.d < 30 && pj.along >= minimo) { cs = cs.slice(0, q + 1); kmVolta = pj.along; break; }
+        }
+        est.desvio = { origem: p, t: Date.now(), km: kmVolta, ruas: ruas, coords: cs };
+        est.desvioMsg = null;
+        if (est.fora) linhaDesvio.setLatLngs(est.desvio.coords);
+      });
+    }).catch(function () {
+      desvioFalhou = Date.now(); est.desvioMsg = 'Não consegui calcular pelas ruas agora.';
+    }).then(function () { desvioEmCurso = false; if (est.fora && est.ultimo) aoPosicionar(est.ultimo[0], est.ultimo[1], est.acc || 20, null); });
+  }
 
   // marcos de km
   for (var k = 5000; k < TOTAL; k += 5000) {
@@ -246,15 +285,34 @@
 
     // alerta fora da rota
     if (est.fora) {
-      var r = rumo(p, pr.ponto);
       $('alerta').hidden = false;
-      $('alertaTit').textContent = 'Fora da rota · ' + fmtDist(pr.d);
-      $('alertaTxt').textContent = 'A linha azul fica a ' + fmtDist(pr.d) + ' para o ' + pontoCardeal(r) + '. Siga a seta' + (head != null ? ' (relativa à direção em que você anda).' : ' (norte para cima).');
-      $('setaSvg').style.transform = 'rotate(' + ((r - (head != null ? head : 0)) + 360) % 360 + 'deg)';
-      linhaVolta.setLatLngs([p, pr.ponto]);
       chip('fora', 'Fora da rota');
+      pedirDesvio(p);
+      var alvo = pr.ponto, viaRuas = est.desvio && est.desvio.coords.length > 1;
+      if (viaRuas) {
+        // segue o caminho calculado pelas ruas: mira ~40 m à frente no trajeto de volta
+        var dc = est.desvio.coords, k0 = 0, dmin = 1e12;
+        for (var k = 0; k < dc.length; k++) { var dd = L.latLng(dc[k]).distanceTo(p); if (dd < dmin) { dmin = dd; k0 = k; } }
+        var acc2 = 0, k1 = k0;
+        while (k1 < dc.length - 1 && acc2 < 40) { acc2 += L.latLng(dc[k1]).distanceTo(dc[k1 + 1]); k1++; }
+        alvo = dc[k1];
+        var falta2 = k0 === 0 ? L.latLng(p).distanceTo(dc[0]) : 0; for (var k2 = k0; k2 < dc.length - 1; k2++) falta2 += L.latLng(dc[k2]).distanceTo(dc[k2 + 1]);
+        $('alertaTit').textContent = 'Fora da rota · volta em ' + fmtDist(falta2);
+        $('kmFalta').textContent = fmtKm(falta2 + TOTAL - est.desvio.km);
+        $('alertaTxt').textContent = 'Siga a linha laranja pelas ruas' + (est.desvio.ruas.length ? ': ' + est.desvio.ruas.slice(0, 3).join(' → ') : '') + '. Ela leva de volta à Rota da Luz no km ' + fmtKm(est.desvio.km) + '.';
+        // se você está fora de qualquer rua (campo, terreno), liga o ponto azul ao início do caminho
+        linhaVolta.setLatLngs(L.latLng(dc[0]).distanceTo(p) > 20 && k0 === 0 ? [p, dc[0]] : []);
+      } else {
+        var r0 = rumo(p, pr.ponto);
+        $('alertaTit').textContent = 'Fora da rota · ' + fmtDist(pr.d);
+        $('alertaTxt').textContent = (est.desvioMsg || 'A linha azul fica a ' + fmtDist(pr.d) + ' para o ' + pontoCardeal(r0) + '.') + ' Siga a seta' + (head != null ? ' (relativa à direção em que você anda).' : ' (norte para cima).');
+        linhaVolta.setLatLngs([p, pr.ponto]);
+      }
+      var r = rumo(p, alvo);
+      $('setaSvg').style.transform = 'rotate(' + ((r - (head != null ? head : 0)) + 360) % 360 + 'deg)';
     } else {
       $('alerta').hidden = true; linhaVolta.setLatLngs([]);
+      if (est.desvio || est.desvioMsg) { est.desvio = null; est.desvioMsg = null; linhaDesvio.setLatLngs([]); }
       var voltando = est.historico.length > 3 && est.maxAlong - along > 300 && pr.d < limite;
       if (fraco) chip('ruim', 'GPS fraco ±' + Math.round(acc) + ' m');
       else if (voltando) chip('ruim', 'Sentido contrário?');
