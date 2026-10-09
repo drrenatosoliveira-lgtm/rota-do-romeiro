@@ -282,20 +282,65 @@
   }
 
   // ---------- GPS ----------
+  var UA = navigator.userAgent || '';
+  var IOS = /iPhone|iPad|iPod/.test(UA) || (/Macintosh/.test(UA) && 'ontouchend' in document);
+  var NAV_INTERNO = /Instagram|FBAN|FBAV|FB_IAB|Line\/|WhatsApp|; wv\)|GSA\//.test(UA);
+  var diag = { erro: '-', fixes: 0, ultimoFix: null, precisao: null, modo: '-' };
+
+  function ajudaPermissao() {
+    return IOS
+      ? 'No iPhone: Ajustes > Privacidade e Segurança > Serviços de Localização (ligado) > Sites do Safari > "Ao Usar o App" e "Localização Precisa" ligada. Depois recarregue esta página.'
+      : 'No Android: ligue a Localização do celular (puxe a barra de cima). Depois, no Chrome, toque no ícone ao lado do endereço > Permissões > Localização > Permitir. Recarregue a página.';
+  }
+  function aoFix(pos) {
+    if (est.sim) return;
+    var c = pos.coords;
+    diag.fixes++; diag.ultimoFix = new Date(); diag.precisao = Math.round(c.accuracy);
+    aoPosicionar(c.latitude, c.longitude, c.accuracy, (c.heading != null && !isNaN(c.heading) && c.speed > 0.4) ? c.heading : null);
+  }
+  var reserva = null;
+  function aoErro(err) {
+    diag.erro = ['', 'permissão negada', 'posição indisponível', 'demorou demais'][err.code] || String(err.message);
+    if (err.code === 1) {
+      chip('fora', 'Localização bloqueada');
+      avisoFixo('Localização bloqueada', ajudaPermissao());
+      return;
+    }
+    if (!est.ultimo) chip('ruim', 'Procurando sinal…');
+    // sem sinal de GPS preciso (ex.: dentro de casa): tenta também a localização aproximada
+    if (reserva == null) {
+      diag.modo = 'GPS + aproximada';
+      reserva = navigator.geolocation.watchPosition(aoFix, function () {}, { enableHighAccuracy: false, maximumAge: 60000, timeout: 60000 });
+    }
+  }
   function ligarGPS() {
     destravarAudio();
-    if (!('geolocation' in navigator)) { chip('fora', 'Sem GPS'); return; }
+    if (!window.isSecureContext) { avisoFixo('Endereço inseguro', 'Abra pelo link https://drrenatosoliveira-lgtm.github.io/rota-do-romeiro/'); return; }
+    if (!('geolocation' in navigator)) { chip('fora', 'Sem GPS'); avisoFixo('Navegador sem GPS', 'Abra o link no Chrome (Android) ou no Safari (iPhone).'); return; }
+    if (est.watchId != null) return;
     chip('ruim', 'Procurando GPS…');
-    est.watchId = navigator.geolocation.watchPosition(function (pos) {
-      if (est.sim) return;
-      var c = pos.coords;
-      aoPosicionar(c.latitude, c.longitude, c.accuracy, (c.heading != null && !isNaN(c.heading) && c.speed > 0.4) ? c.heading : null);
-    }, function (err) {
-      chip('fora', err.code === 1 ? 'GPS bloqueado' : 'Sem sinal de GPS');
-      if (err.code === 1) alertaSimples('Permita a localização', 'Toque no cadeado da barra de endereço e libere "Localização" para este site.');
-    }, { enableHighAccuracy: true, maximumAge: 3000, timeout: 30000 });
+    diag.modo = 'GPS';
+    // primeira posição rápida (pode ser aproximada) + acompanhamento preciso
+    navigator.geolocation.getCurrentPosition(aoFix, aoErro, { enableHighAccuracy: false, maximumAge: 120000, timeout: 15000 });
+    est.watchId = navigator.geolocation.watchPosition(aoFix, aoErro, { enableHighAccuracy: true, maximumAge: 5000, timeout: 45000 });
     $('iniciar').hidden = true;
+    store.set('gpsLigado', true);
     pedirTelaLigada();
+    setTimeout(function () {
+      if (!diag.fixes && !est.sim) avisoFixo('Ainda sem localização', 'Vá para perto de uma janela ou para fora de casa e espere um pouco. Se continuar assim: ' + ajudaPermissao());
+    }, 25000);
+  }
+  function avisoFixo(t, s) {
+    $('alerta').hidden = false; $('alertaTit').textContent = t; $('alertaTxt').textContent = s;
+    $('setaSvg').style.transform = 'rotate(0deg)';
+  }
+  if (NAV_INTERNO) avisoFixo('Abra no navegador', 'Este link abriu dentro de outro app (WhatsApp/Instagram), que costuma bloquear o GPS. Toque nos 3 pontinhos e escolha "Abrir no ' + (IOS ? 'Safari' : 'Chrome') + '".');
+  // se a localização já foi liberada antes, liga sozinho ao abrir
+  if (navigator.permissions && navigator.permissions.query) {
+    navigator.permissions.query({ name: 'geolocation' }).then(function (p) {
+      diag.permissao = p.state;
+      if (p.state === 'granted' && store.get('gpsLigado', false)) ligarGPS();
+    }).catch(function () {});
   }
   function alertaSimples(t, s) {
     $('alerta').hidden = false; $('alertaTit').textContent = t; $('alertaTxt').textContent = s;
@@ -390,6 +435,13 @@
         '<label for="simOff">Desvio lateral: <b id="simOffTxt">0</b> m</label><input type="range" id="simOff" min="0" max="400" step="10" value="0">' +
         '<p style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="botao" id="simLiga">' + (est.sim ? 'Atualizar' : 'Ligar simulação') + '</button><button class="botao sec" id="simDesliga">Voltar ao GPS real</button></p></div>' +
         '<div class="bloco"><h3>Ritmo</h3><label for="ritmo">Velocidade para a previsão: <b id="ritmoTxt">' + est.ritmo.toFixed(1).replace('.', ',') + '</b> km/h</label><input type="range" id="ritmo" min="2.5" max="6.5" step="0.1" value="' + est.ritmo.toFixed(1) + '"><p style="font-size:13px;color:var(--sutil)">Depois de 10 minutos andando, o app passa a usar o seu ritmo real.</p></div>' +
+        '<div class="bloco"><h3>Diagnóstico do GPS</h3><p style="font-size:14px">' +
+        'Aparelho: ' + (IOS ? 'iPhone' : 'Android/outro') + (NAV_INTERNO ? ' · <b style="color:var(--perigo)">navegador interno de app</b>' : '') +
+        '<br>Site seguro: ' + (window.isSecureContext ? 'sim' : 'não') +
+        '<br>Permissão: ' + (diag.permissao || 'não informada') +
+        '<br>GPS ligado: ' + (est.watchId != null ? 'sim (' + diag.modo + ')' : 'não; toque em "Começar caminhada"') +
+        '<br>Posições recebidas: ' + diag.fixes + (diag.ultimoFix ? ' · última às ' + hora(diag.ultimoFix) + ' · precisão ±' + diag.precisao + ' m' : '') +
+        '<br>Último erro: ' + diag.erro + '</p><p style="font-size:13px;color:var(--sutil)">' + ajudaPermissao() + '</p></div>' +
         '<div class="bloco"><h3>Zerar progresso</h3><p><button class="botao sec" id="zerar">Zerar km percorridos</button></p></div>';
     }
     $('gavCorpo').innerHTML = h;
